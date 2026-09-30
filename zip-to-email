@@ -1,0 +1,46 @@
+import zipfile, hashlib, mimetypes, shutil, logging
+from pathlib import Path
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from email import policy
+
+SRC  = Path(r"\\fileserver\share\incoming")   # or r"C:\data\incoming"
+OUT  = Path(r"\\fileserver\share\eml_out")
+DONE = SRC / "_processed"
+logging.basicConfig(filename="zip2eml.log", level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+
+def zip_to_eml(zpath: Path) -> Path:
+    parts, manifest = [], []
+    with zipfile.ZipFile(zpath) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            data = zf.read(info)
+            name = Path(info.filename).name          # flatten names; blocks zip-slip
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            parts.append((data, *ctype.split("/", 1), name))
+            manifest.append(f"{info.filename}\t{info.file_size}\t{hashlib.sha256(data).hexdigest()}")
+
+    msg = EmailMessage()
+    msg["From"] = "archiver@example.com"
+    msg["To"] = "archive@example.com"
+    msg["Subject"] = f"Contents of {zpath.name}"
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    msg.set_content("Source: " + str(zpath) + "\n\nFile\tSize\tSHA-256\n" + "\n".join(manifest))
+    for data, maintype, subtype, name in parts:
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+
+    out = OUT / f"{zpath.stem}.eml"
+    out.write_bytes(msg.as_bytes(policy=policy.SMTP))   # CRLF line endings
+    return out
+
+DONE.mkdir(exist_ok=True)
+for z in SRC.glob("*.zip"):          # rglob("*.zip") to include subfolders
+    try:
+        eml = zip_to_eml(z)
+        shutil.move(str(z), DONE / z.name)   # makes reruns idempotent
+        logging.info("OK %s -> %s", z, eml)
+    except (zipfile.BadZipFile, RuntimeError) as e:   # RuntimeError = encrypted zip
+        logging.error("FAIL %s: %s", z, e)
