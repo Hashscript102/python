@@ -1,0 +1,369 @@
+"""
+office_search.py -- search Excel and Word files for words, phrases or regex
+WITHOUT opening Excel/Word. Files are read directly from disk (read-only), so it
+works on UNC shares, doesn't lock files, and never triggers macros.
+
+Supports
+  Excel : .xlsx .xlsm .xltx (openpyxl)   .xls (xlrd)   .csv
+  Word  : .docx .docm .dotx  -- body, tables, headers/footers, footnotes,
+          endnotes, comments, text boxes
+  (.doc legacy Word is listed as "skipped"; convert to .docx or ask for COM support)
+
+Install
+  pip install openpyxl xlrd pandas
+
+Examples
+  python office_search.py "\\\\server\\share\\Finance" -r -q "invoice 4471"
+  python office_search.py C:\\Docs -r -q "retention" -q "legal hold" -o hits.xlsx
+  python office_search.py C:\\Docs -r -q "\\b\\d{3}-\\d{2}-\\d{4}\\b" --regex --type excel
+  python office_search.py C:\\Docs -r -q "breach" -q "notify" --all --type word
+  python office_search.py C:\\Docs                     # prompts for terms
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import fnmatch
+import os
+import re
+import sys
+import time
+import zipfile
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+EXCEL_EXT = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".csv"}
+WORD_EXT = {".docx", ".docm", ".dotx", ".dotm"}
+LEGACY_EXT = {".doc"}
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+CONTEXT = 120
+
+
+# --------------------------------------------------------------------------- #
+# Matching
+# --------------------------------------------------------------------------- #
+class Matcher:
+    def __init__(self, terms, regex, case, word, all_terms):
+        flags = 0 if case else re.IGNORECASE
+        def comp(t):
+            pat = t if regex else r"\s+".join(re.escape(w) for w in t.split())
+            return re.compile(rf"\b(?:{pat})\b" if word else pat, flags)
+        if all_terms and len(terms) > 1:
+            self.groups = [(" AND ".join(terms), [comp(t) for t in terms])]
+        else:
+            self.groups = [(t, [comp(t)]) for t in terms]
+
+    def find(self, text):
+        """Yield (term_label, matched_text, start, end) for each matching term group."""
+        for label, rxs in self.groups:
+            ms = [rx.search(text) for rx in rxs]
+            if all(ms):
+                m = ms[0]
+                yield label, m.group(0), m.start(), m.end()
+
+
+def snippet(text, s, e):
+    a, b = max(0, s - CONTEXT), min(len(text), e + CONTEXT)
+    t = " ".join(text[a:b].split())
+    return ("…" if a else "") + t + ("…" if b < len(text) else "")
+
+
+# --------------------------------------------------------------------------- #
+# Excel
+# --------------------------------------------------------------------------- #
+def col_letter(n):
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def iter_excel(path, formulas):
+    """Yield (location_dict, text)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+            for r, row in enumerate(csv.reader(f), start=1):
+                for c, v in enumerate(row, start=1):
+                    if v:
+                        yield {"sheet": "", "cell": f"{col_letter(c)}{r}", "row": r, "col": c}, v
+    elif ext == ".xls":
+        import xlrd
+        book = xlrd.open_workbook(path, on_demand=True)
+        for sh in book.sheets():
+            for r in range(sh.nrows):
+                for c, v in enumerate(sh.row_values(r), start=1):
+                    if v not in ("", None):
+                        yield {"sheet": sh.name, "cell": f"{col_letter(c)}{r + 1}",
+                               "row": r + 1, "col": c}, str(v)
+            book.unload_sheet(sh.name)
+    else:
+        import openpyxl
+        # values pass: cached results of formulas; formulas pass (optional): formula text
+        passes = [(True, "")] + ([(False, " (formula)")] if formulas else [])
+        for data_only, tag in passes:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=data_only)
+            try:
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows():
+                        for cell in row:
+                            v = getattr(cell, "value", None)
+                            if v is None:
+                                continue
+                            if not data_only and not (isinstance(v, str) and v.startswith("=")):
+                                continue
+                            yield {"sheet": ws.title + tag, "cell": cell.coordinate,
+                                   "row": cell.row, "col": cell.column}, str(v)
+            finally:
+                wb.close()
+
+
+# --------------------------------------------------------------------------- #
+# Word (.docx read straight from the zip/XML -- catches text boxes, comments, etc.)
+# --------------------------------------------------------------------------- #
+def para_text(p):
+    parts = []
+    for el in p.iter():
+        if el.tag == W + "t" and el.text:
+            parts.append(el.text)
+        elif el.tag == W + "tab":
+            parts.append("\t")
+        elif el.tag in (W + "br", W + "cr"):
+            parts.append("\n")
+    return "".join(parts)
+
+
+def walk_body(elem, part, out, ctx):
+    """Recursive walk keeping track of paragraph numbers and table/row/cell positions."""
+    for child in elem:
+        tag = child.tag
+        if tag == W + "p":
+            ctx["para"] += 1
+            # text boxes inside this paragraph get walked separately
+            boxes = child.findall(f".//{W}txbxContent")
+            txt = para_text(child) if not boxes else "".join(
+                para_text(r) for r in child if r.tag != W + "r" or r.find(f".//{W}txbxContent") is None)
+            if txt.strip():
+                loc = {"part": part, "para": ctx["para"]}
+                if ctx.get("table"):
+                    loc.update(table=ctx["table"], row=ctx["row"], col=ctx["col"])
+                out.append((loc, txt))
+            for b in boxes:
+                walk_body(b, part + " (text box)", out, ctx)
+        elif tag == W + "tbl":
+            ctx["tables"] += 1
+            saved = (ctx.get("table"), ctx.get("row"), ctx.get("col"))
+            ctx["table"] = ctx["tables"]
+            for r_i, tr in enumerate(child.findall(W + "tr"), start=1):
+                for c_i, tc in enumerate(tr.findall(W + "tc"), start=1):
+                    ctx["row"], ctx["col"] = r_i, c_i
+                    walk_body(tc, part, out, ctx)
+            ctx["table"], ctx["row"], ctx["col"] = saved
+        elif tag in (W + "sdt", W + "sdtContent", W + "body", W + "hdr", W + "ftr",
+                     W + "footnote", W + "endnote", W + "comment", W + "customXml",
+                     W + "footnotes", W + "endnotes", W + "comments"):
+            walk_body(child, part, out, ctx)
+
+
+def part_label(name):
+    base = os.path.basename(name)[:-4]
+    return {"document": "body", "footnotes": "footnotes", "endnotes": "endnotes",
+            "comments": "comments"}.get(base, base)  # header1, footer2…
+
+
+def iter_word(path):
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        order = ["word/document.xml"] + sorted(
+            n for n in names if re.match(r"word/(header|footer)\d*\.xml$", n)) + \
+            [n for n in ("word/footnotes.xml", "word/endnotes.xml", "word/comments.xml") if n in names]
+        for name in order:
+            if name not in names:
+                continue
+            root = ET.fromstring(z.read(name))
+            out, ctx = [], {"para": 0, "tables": 0}
+            walk_body(root, part_label(name), out, ctx)
+            yield from out
+
+
+# --------------------------------------------------------------------------- #
+# Per-file search
+# --------------------------------------------------------------------------- #
+def search_file(path, matcher, formulas, max_hits):
+    ext = os.path.splitext(path)[1].lower()
+    kind = "Excel" if ext in EXCEL_EXT else "Word" if ext in WORD_EXT else "legacy"
+    if kind == "legacy":
+        return [], "skipped (.doc -- convert to .docx)"
+    if os.path.basename(path).startswith("~$"):
+        return [], "skipped (Office lock file)"
+    hits = []
+    try:
+        source = iter_excel(path, formulas) if kind == "Excel" else iter_word(path)
+        for loc, text in source:
+            for label, m, s, e in matcher.find(text):
+                if kind == "Excel":
+                    where = f"{loc['sheet']}!{loc['cell']}" if loc["sheet"] else loc["cell"]
+                else:
+                    where = f"{loc['part']} ¶{loc['para']}"
+                    if "table" in loc:
+                        where += f" (table {loc['table']}, row {loc['row']}, col {loc['col']})"
+                hits.append({"term": label, "type": kind, "file": path, "location": where,
+                             "sheet_or_part": loc.get("sheet", loc.get("part", "")),
+                             "cell": loc.get("cell", ""), "row": loc.get("row", ""),
+                             "col": loc.get("col", ""), "match": m,
+                             "context": snippet(text, s, e)})
+                if max_hits and len(hits) >= max_hits:
+                    return hits, "max-hits"
+    except zipfile.BadZipFile:
+        return hits, "error: not a valid Office file (encrypted or corrupt?)"
+    except Exception as ex:
+        msg = str(ex)
+        if "encrypted" in msg.lower() or "password" in msg.lower():
+            return hits, "error: password-protected"
+        return hits, f"error: {type(ex).__name__}: {msg[:200]}"
+    return hits, "ok"
+
+
+# --------------------------------------------------------------------------- #
+# Discovery / output / main
+# --------------------------------------------------------------------------- #
+def iter_files(roots, recursive, exts, exclude, since, until):
+    exc = [p.strip().lower() for p in exclude.split(",") if p.strip()]
+    for root in roots:
+        if os.path.isfile(root):
+            yield root
+            continue
+        if not os.path.isdir(root):
+            print(f"! not reachable: {root}", file=sys.stderr)
+            continue
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                if recursive:
+                                    stack.append(e.path)
+                                continue
+                            n = e.name.lower()
+                            if os.path.splitext(n)[1] not in exts or n.startswith("~$"):
+                                continue
+                            if any(fnmatch.fnmatch(n, p) for p in exc):
+                                continue
+                            if since or until:
+                                mt = e.stat().st_mtime
+                                if (since and mt < since) or (until and mt > until):
+                                    continue
+                            yield e.path
+                        except OSError:
+                            pass
+            except OSError as ex:
+                print(f"! cannot list {d}: {ex}", file=sys.stderr)
+
+
+def save(rows, out):
+    cols = ["term", "type", "file", "location", "sheet_or_part", "cell", "row", "col", "match", "context"]
+    if out.lower().endswith(".xlsx"):
+        import pandas as pd
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        df = pd.DataFrame(rows, columns=cols).map(
+            lambda v: ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v)
+        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+            df.to_excel(xw, sheet_name="Hits", index=False)
+            df.groupby(["term", "file"]).size().reset_index(name="hits") \
+              .to_excel(xw, sheet_name="Summary", index=False)
+            for ws in xw.book.worksheets:
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+            for col, wdt in zip("ABCDEFGHIJ", (18, 7, 60, 40, 18, 8, 6, 6, 20, 100)):
+                xw.book["Hits"].column_dimensions[col].width = wdt
+    else:
+        with open(out, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows)
+    print(f"Saved {len(rows)} hit(s) -> {os.path.abspath(out)}")
+
+
+def parse_date(s, end=False):
+    if not s:
+        return None
+    dt = datetime.strptime(s, "%Y-%m-%d")
+    return (dt.replace(hour=23, minute=59, second=59) if end else dt).timestamp()
+
+
+def main():
+    p = argparse.ArgumentParser(description="Search Excel/Word files without opening Office.")
+    p.add_argument("roots", nargs="+", help=r"folders or files (UNC ok: \\server\share\dir)")
+    p.add_argument("-q", "--query", action="append", default=[], help="search term (repeatable)")
+    p.add_argument("--terms", help="file with one term per line")
+    p.add_argument("--type", choices=["all", "excel", "word"], default="all")
+    p.add_argument("--regex", action="store_true")
+    p.add_argument("--case", action="store_true")
+    p.add_argument("-w", "--word", action="store_true", help="whole words only")
+    p.add_argument("--all", dest="all_terms", action="store_true",
+                   help="cell/paragraph must contain ALL terms")
+    p.add_argument("--formulas", action="store_true", help="Excel: also search formula text")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--exclude", default="", help="comma-separated filename patterns to skip")
+    p.add_argument("--since", help="modified on/after YYYY-MM-DD")
+    p.add_argument("--until", help="modified on/before YYYY-MM-DD")
+    p.add_argument("--max-per-file", type=int, default=0)
+    p.add_argument("--threads", type=int, default=6)
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("-o", "--out", help="save hits to .xlsx or .csv")
+    a = p.parse_args()
+
+    terms = list(a.query)
+    if a.terms:
+        terms += [l.strip() for l in open(a.terms, encoding="utf-8") if l.strip() and not l.startswith("#")]
+    if not terms:
+        raw = input("Search terms (separate several with ' | '): ").strip()
+        terms = [t.strip() for t in raw.split(" | ") if t.strip()]
+    if not terms:
+        sys.exit("No search terms.")
+    try:
+        matcher = Matcher(terms, a.regex, a.case, a.word, a.all_terms)
+    except re.error as e:
+        sys.exit(f"Bad regex: {e}")
+
+    exts = {"all": EXCEL_EXT | WORD_EXT | LEGACY_EXT, "excel": EXCEL_EXT,
+            "word": WORD_EXT | LEGACY_EXT}[a.type]
+    print("Listing files…", file=sys.stderr)
+    files = list(iter_files(a.roots, a.recursive, exts, a.exclude,
+                            parse_date(a.since), parse_date(a.until, True)))
+    print(f"{len(files)} file(s) to search\n", file=sys.stderr)
+
+    t0, rows, notes = time.time(), [], []
+    with ThreadPoolExecutor(max_workers=a.threads) as pool:
+        futs = {pool.submit(search_file, f, matcher, a.formulas, a.max_per_file): f for f in files}
+        for i, fut in enumerate(as_completed(futs), start=1):
+            hits, status = fut.result()
+            if status not in ("ok", "max-hits"):
+                notes.append((futs[fut], status))
+            rows.extend(hits)
+            if not a.quiet:
+                for h in hits:
+                    print(f"{h['file']} | {h['location']} | [{h['term']}] {h['context']}")
+            if i % 50 == 0:
+                print(f"  …{i}/{len(files)} files, {len(rows)} hits", file=sys.stderr)
+
+    print(f"\n{len(rows)} hit(s) in {len({r['file'] for r in rows})} file(s); "
+          f"searched {len(files)} file(s) in {time.time() - t0:.1f}s", file=sys.stderr)
+    for f, s in notes[:30]:
+        print(f"! {f}: {s}", file=sys.stderr)
+    if len(notes) > 30:
+        print(f"! …and {len(notes) - 30} more skipped/errored", file=sys.stderr)
+
+    if a.out and rows:
+        rows.sort(key=lambda r: (r["file"], str(r["location"])))
+        save(rows, a.out)
+
+
+if __name__ == "__main__":
+    main()
