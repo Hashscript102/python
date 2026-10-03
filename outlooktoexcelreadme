@@ -1,0 +1,28 @@
+Here's outlook_to_excel.py. It reads your mailbox through Outlook's COM interface (win32com), so it uses your existing desktop Outlook session and needs no passwords or app registration.
+
+Setup:
+
+pip install pywin32 pandas openpyxl beautifulsoup4 pdfplumber python-docx xlrd
+
+How to run it:
+
+Run it with no arguments and it asks you for the scope (whole folder, a date range, or the last N days), what to extract (body, attachments, or both), and the folder.
+Or pass flags, for example: --start 2026-09-01 --end 2026-09-30 --mode both --folder "Inbox/Vendors" --subfolders
+Optional filters: --sender "@acme.com", --subject invoice, --mailbox "Shared Mailbox Name", and --limit 20 for a test run.
+
+What it extracts, one value per row:
+
+Emails sheet: one row per email with its metadata and full body.
+Body_Fields sheet: every Label: value, Label = value, or Label - value line in the body. Quoted reply history is skipped unless you add --keep-thread.
+Tables sheet: every cell from HTML tables in the body and from CSV, XLSX, PDF, and DOCX attachments. Each cell gets its own row with the row number, column number, column header, and value.
+Attach_Fields sheet: label/value pairs found in the text of PDF, DOCX, and TXT attachments.
+Fields_Wide sheet: the same fields pivoted so each email is one row and each label is a column.
+Attachments sheet: shows whether each attachment was parsed, skipped, or failed. Embedded .msg emails are opened and processed too, and image attachments are skipped by default.
+
+What I tested: the parsing and the Excel output, here on Linux. I couldn't test the Outlook COM part without Windows and Outlook.
+
+What to check on your machine:
+
+Start with --limit 10.
+If date filtering returns nothing, your Windows date format is probably not the US m/d/y format. The date string is set in restrict_items().
+Since this is pulling Wells Fargo mail, you'll want to keep the output inside approved storage.
