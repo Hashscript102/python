@@ -1,0 +1,31 @@
+Everything checked out: UTF-16 Windows logs, .gz and .zip archives, context lines, AND matching, binary files skipped, and the Excel export.
+
+log_search.py searches one or more log folders, local or UNC, and needs no installs beyond pandas openpyxl, which are only for the Excel output.
+
+Typical runs
+
+python log_search.py "\\server\d$\logs" -q "timeout"
+python log_search.py "\\srv1\d$\logs" "\\srv2\d$\logs" -r -q "error 500" -q "access denied" -C 2
+python log_search.py "\\server\d$\logs" -r -q "Exception|FATAL" --regex --since 2026-09-25 -o hits.xlsx
+
+If you leave out -q, it prompts you for terms; separate several with |.
+
+Main options
+
+Multiple roots: list as many servers or folders as you want. Add -r to include subfolders.
+Matching:
+Any term matches by default.
+--all requires every term on the same line, for example -q error -q db01 --all.
+-w matches whole words only, --case makes it case-sensitive, and -v shows lines that don't match.
+Filters:
+--since and --until filter by file modified date, which skips old logs fast on big shares.
+--include and --exclude take filename patterns.
+Context: -C 2 shows 2 lines before and after each hit, which helps with stack traces. -B and -A set before and after separately.
+File types: reads .gz and .zip archives without extracting them, and auto-detects UTF-16 Windows logs that most tools mangle.
+Speed: scans 8 files in parallel by default. Try --threads 16 over slow SMB.
+Output:
+Hits print to the console with the match highlighted.
+-o hits.xlsx saves every hit with file, line number and context, plus a summary sheet.
+It switches to CSV automatically if there are more than 1M hits.
+
+d$ is an admin share, so run this as an account with admin rights on those servers. A list of known error signatures in a --terms errors.txt file turns this into a quick daily health check.
