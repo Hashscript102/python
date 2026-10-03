@@ -1,0 +1,25 @@
+office_search.py reads Excel and Word files straight from disk. Excel and Word never launch, files aren't locked, macros never run, and UNC shares work.
+
+Setup
+
+pip install openpyxl xlrd pandas
+
+Typical runs
+
+python office_search.py "\\server\share\Finance" -r -q "invoice 4471"
+python office_search.py C:\Docs -r -q "legal hold" -q "retention" -o hits.xlsx
+python office_search.py C:\Docs -r -q "breach" -q "notify" --all --type word
+
+What it covers
+
+Excel (.xlsx, .xlsm, .xls, .csv): reports the exact sheet and cell, for example Invoices!B3. Add --formulas to also search formula text.
+Word (.docx): searches body paragraphs, table cells (with table, row and column), headers and footers, footnotes, endnotes, comments, and text boxes.
+Options: the same as the log tool:
+--regex, -w for whole words, --all to require every term
+--since/--until and --type excel|word
+-o hits.xlsx to save every hit with its location plus a summary sheet
+Problem files: password-protected or corrupt files are reported and skipped instead of crashing the run.
+
+Not covered: legacy .doc files are listed as skipped. If you have a lot of them, I can add an option that converts them through Word in the background.
+
+You now have three tools that share the same options: pdf_search.py, log_search.py, and office_search.py. If you'd rather run one command across PDFs, Office files and logs in the same folder tree, I can merge them into a single tool.
