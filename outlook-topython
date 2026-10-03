@@ -1,0 +1,540 @@
+"""
+outlook_to_excel.py
+-------------------
+Walk an Outlook (desktop) mailbox via COM, either everything or a date range,
+and export email content -- inline body and/or attachments -- to Excel at a
+granular level (one value per row, plus a wide one-row-per-email pivot).
+
+Requires: Windows + Outlook desktop running/configured.
+    pip install pywin32 pandas openpyxl beautifulsoup4 pdfplumber python-docx xlrd
+
+Examples
+    python outlook_to_excel.py                                  # interactive prompts
+    python outlook_to_excel.py --start 2026-09-01 --end 2026-09-30 --mode both
+    python outlook_to_excel.py --all --folder "Inbox/Vendors" --subfolders --mode attachments
+    python outlook_to_excel.py --start 2026-10-01 --sender "@acme.com" --subject "invoice"
+
+Output workbook sheets
+    Emails          one row per email (metadata + full body text)
+    Body_Fields     every "Label: value" pair found in the body, one per row
+    Body_Lines      every non-empty body line, one per row  (--lines)
+    Tables          every table cell (HTML body tables, CSV/XLSX/PDF/DOCX tables),
+                    one cell per row with row #, column #, header, value
+    Attach_Fields   "Label: value" pairs found in attachment text (PDF/DOCX/TXT)
+    Attachments     one row per attachment with status / error
+    Fields_Wide     one row per email, one column per distinct field label
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import tempfile
+import traceback
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+try:
+    import win32com.client  # pywin32
+    import pywintypes
+except ImportError:  # allows the parsing helpers to be imported/tested off Windows
+    win32com = None
+    pywintypes = None
+
+try:
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+except Exception:
+    ILLEGAL_CHARACTERS_RE = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+OL_FOLDER_INBOX = 6
+OL_MAIL_ITEM_CLASS = 43
+OL_ATTACH_BY_VALUE = 1
+OL_ATTACH_EMBEDDED_ITEM = 5
+EXCEL_CELL_MAX = 32_000
+EXCEL_ROW_MAX = 1_048_000
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".emz", ".wmz", ".svg"}
+
+# "Label: value" / "Label = value" / "Label - value" (dash needs spaces around it)
+KV_RE = re.compile(
+    r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 _#&/().'\-]{0,60}?)\s*(?::|=|\s-\s|\t)\s*(?P<val>\S.*?)\s*$"
+)
+# keys that look like reply headers / noise we don't want as "fields"
+KV_SKIP = {"http", "https", "mailto", "tel", "cid"}
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def clean(v):
+    """Make a value safe for an Excel cell."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    s = str(v)
+    s = ILLEGAL_CHARACTERS_RE.sub("", s)
+    if len(s) > EXCEL_CELL_MAX:
+        s = s[:EXCEL_CELL_MAX] + " …[truncated]"
+    return s
+
+
+def to_naive(dt):
+    """pywintypes datetime (tz-aware) -> naive python datetime."""
+    if dt is None:
+        return None
+    try:
+        return datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+    except Exception:
+        return None
+
+
+def extract_kv(text: str):
+    """Yield (key, value) pairs from free text, one per matching line."""
+    for line in (text or "").splitlines():
+        m = KV_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group("key").strip(), m.group("val").strip()
+        if key.lower() in KV_SKIP or len(val) == 0:
+            continue
+        if re.search(r"\b(https?|www|mailto)\b", key, re.I) or val.startswith("//"):
+            continue
+        yield key, val
+
+
+def strip_quoted_reply(text: str) -> str:
+    """Cut the body at the first quoted-reply marker so old thread text isn't re-parsed."""
+    markers = [
+        r"^\s*From:\s.+\n\s*Sent:\s",          # Outlook reply header
+        r"^-{2,}\s*Original Message\s*-{2,}",
+        r"^On .+ wrote:\s*$",
+        r"^_{10,}\s*$",
+    ]
+    cut = len(text)
+    for pat in markers:
+        m = re.search(pat, text, flags=re.MULTILINE | re.IGNORECASE)
+        if m and m.start() > 0:
+            cut = min(cut, m.start())
+    return text[:cut]
+
+
+def table_rows_to_cells(rows, email_key, source, table_no, header_row=True):
+    """rows: list[list[str]] -> granular cell records."""
+    out = []
+    if not rows:
+        return out
+    headers = rows[0] if header_row else []
+    start = 1 if header_row and len(rows) > 1 else 0
+    if start == 0:
+        headers = []
+    for r_i, row in enumerate(rows[start:], start=1):
+        for c_i, val in enumerate(row, start=1):
+            hdr = headers[c_i - 1] if c_i - 1 < len(headers) else f"col{c_i}"
+            if str(val).strip() == "":
+                continue
+            out.append({
+                "email_key": email_key, "source": source, "table_no": table_no,
+                "row_no": r_i, "col_no": c_i, "header": clean(hdr), "value": clean(val),
+            })
+    return out
+
+
+def html_tables(html: str):
+    """Return list of tables, each a list of rows (list[str]). Skips layout-only tables."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html or "", "html.parser")
+    tables = []
+    for t in soup.find_all("table"):
+        if t.find("table"):  # outer layout table wrapping other tables
+            continue
+        rows = []
+        for tr in t.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if any(cells):
+                rows.append(cells)
+        # ignore 1x1 / single-column layout tables
+        if len(rows) >= 2 and max(len(r) for r in rows) >= 2:
+            tables.append(rows)
+    return tables
+
+
+# --------------------------------------------------------------------------- #
+# Attachment parsers -> (tables, text)
+# --------------------------------------------------------------------------- #
+def parse_attachment(path: str):
+    """Return (list_of_tables_with_names, plain_text). Tables: [(name, rows)]."""
+    ext = os.path.splitext(path)[1].lower()
+    tables, text = [], ""
+
+    if ext in (".csv", ".tsv"):
+        sep = "\t" if ext == ".tsv" else None
+        df = pd.read_csv(path, sep=sep, engine="python", dtype=str, header=None,
+                         keep_default_na=False, on_bad_lines="skip", encoding_errors="replace")
+        tables.append(("csv", df.values.tolist()))
+
+    elif ext in (".xlsx", ".xlsm", ".xls"):
+        sheets = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
+        for name, df in sheets.items():
+            df = df.fillna("")
+            tables.append((f"sheet:{name}", df.values.tolist()))
+
+    elif ext == ".pdf":
+        import pdfplumber
+        parts = []
+        with pdfplumber.open(path) as pdf:
+            for p_i, page in enumerate(pdf.pages, start=1):
+                parts.append(page.extract_text() or "")
+                for t_i, tbl in enumerate(page.extract_tables() or [], start=1):
+                    rows = [[c or "" for c in row] for row in tbl]
+                    tables.append((f"page{p_i}_table{t_i}", rows))
+        text = "\n".join(parts)
+
+    elif ext == ".docx":
+        import docx
+        d = docx.Document(path)
+        text = "\n".join(p.text for p in d.paragraphs)
+        for t_i, t in enumerate(d.tables, start=1):
+            rows = [[c.text.strip() for c in r.cells] for r in t.rows]
+            tables.append((f"table{t_i}", rows))
+
+    elif ext in (".txt", ".log", ".json", ".xml"):
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+
+    elif ext in (".htm", ".html"):
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            html = f.read()
+        for t_i, rows in enumerate(html_tables(html), start=1):
+            tables.append((f"table{t_i}", rows))
+        from bs4 import BeautifulSoup
+        text = BeautifulSoup(html, "html.parser").get_text("\n")
+
+    else:
+        raise ValueError(f"unsupported type {ext}")
+
+    return tables, text
+
+
+# --------------------------------------------------------------------------- #
+# Outlook access
+# --------------------------------------------------------------------------- #
+def get_namespace():
+    if win32com is None:
+        sys.exit("pywin32 not available -- run this on Windows with Outlook installed.")
+    return win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+
+def resolve_folder(ns, path: str | None, mailbox: str | None):
+    """
+    path like "Inbox", "Inbox/Vendors", "Sent Items".
+    mailbox = display name of the store (e.g. a shared mailbox); default store if None.
+    """
+    if mailbox:
+        root = ns.Folders[mailbox]
+    else:
+        root = ns.GetDefaultFolder(OL_FOLDER_INBOX).Parent
+    if not path:
+        return ns.GetDefaultFolder(OL_FOLDER_INBOX) if not mailbox else root.Folders["Inbox"]
+    folder = root
+    for part in [p for p in re.split(r"[\\/]", path) if p]:
+        folder = folder.Folders[part]
+    return folder
+
+
+def walk_folders(folder, recurse: bool):
+    yield folder
+    if recurse:
+        for sub in folder.Folders:
+            yield from walk_folders(sub, True)
+
+
+def restrict_items(folder, start: datetime | None, end: datetime | None):
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+    if start or end:
+        fmt = "%m/%d/%Y %I:%M %p"   # Outlook's Restrict expects a locale date string
+        clauses = []
+        if start:
+            clauses.append(f"[ReceivedTime] >= '{start.strftime(fmt)}'")
+        if end:
+            clauses.append(f"[ReceivedTime] < '{end.strftime(fmt)}'")
+        items = items.Restrict(" AND ".join(clauses))
+    return items
+
+
+def sender_smtp(item):
+    try:
+        if item.SenderEmailType == "EX":
+            exu = item.Sender.GetExchangeUser()
+            if exu:
+                return exu.PrimarySmtpAddress
+        return item.SenderEmailAddress
+    except Exception:
+        return getattr(item, "SenderEmailAddress", "")
+
+
+# --------------------------------------------------------------------------- #
+# Extraction core
+# --------------------------------------------------------------------------- #
+class Collector:
+    def __init__(self, args):
+        self.args = args
+        self.emails, self.body_fields, self.body_lines = [], [], []
+        self.tables, self.attach_fields, self.attachments = [], [], []
+        self.tmp = tempfile.mkdtemp(prefix="ol2xl_")
+        self.counter = 0
+
+    # ---- one mail item ---------------------------------------------------- #
+    def process_item(self, item, folder_path: str, parent_key: str = ""):
+        self.counter += 1
+        key = f"{parent_key}.{self.counter}" if parent_key else str(self.counter)
+        a = self.args
+
+        subject = getattr(item, "Subject", "") or ""
+        frm = sender_smtp(item)
+        if a.subject and a.subject.lower() not in subject.lower():
+            return False
+        if a.sender and a.sender.lower() not in (frm or "").lower():
+            return False
+
+        received = to_naive(getattr(item, "ReceivedTime", None))
+        body = getattr(item, "Body", "") or ""
+        html = getattr(item, "HTMLBody", "") or ""
+        body_for_parse = body if a.keep_thread else strip_quoted_reply(body)
+
+        self.emails.append({
+            "email_key": key, "folder": folder_path,
+            "received": received, "from_name": getattr(item, "SenderName", ""),
+            "from_email": frm, "to": getattr(item, "To", ""), "cc": getattr(item, "CC", ""),
+            "subject": clean(subject), "attachment_count": item.Attachments.Count,
+            "conversation_id": getattr(item, "ConversationID", ""),
+            "entry_id": getattr(item, "EntryID", ""),
+            "body": clean(body),
+        })
+
+        if a.mode in ("inline", "both"):
+            for k, v in extract_kv(body_for_parse):
+                self.body_fields.append({"email_key": key, "field": clean(k), "value": clean(v)})
+            if a.lines:
+                for n, line in enumerate(body_for_parse.splitlines(), start=1):
+                    if line.strip():
+                        self.body_lines.append({"email_key": key, "line_no": n, "text": clean(line.strip())})
+            if html:
+                for t_i, rows in enumerate(html_tables(html), start=1):
+                    self.tables.extend(table_rows_to_cells(rows, key, "body_html", t_i))
+
+        if a.mode in ("attachments", "both"):
+            self.process_attachments(item, key, folder_path)
+        return True
+
+    # ---- attachments ------------------------------------------------------ #
+    def process_attachments(self, item, key, folder_path):
+        for i in range(1, item.Attachments.Count + 1):
+            att = item.Attachments.Item(i)
+            name = getattr(att, "FileName", "") or f"attachment_{i}"
+            ext = os.path.splitext(name)[1].lower()
+            rec = {"email_key": key, "attachment_no": i, "filename": name,
+                   "size_bytes": getattr(att, "Size", ""), "status": "", "detail": ""}
+
+            if ext in IMAGE_EXT and not self.args.include_images:
+                rec["status"] = "skipped (image)"
+                self.attachments.append(rec)
+                continue
+
+            safe = re.sub(r'[<>:"/\\|?*]', "_", name)
+            path = os.path.join(self.tmp, f"{key}_{i}_{safe}")
+            try:
+                att.SaveAsFile(path)
+            except Exception as e:
+                rec["status"], rec["detail"] = "save failed", str(e)
+                self.attachments.append(rec)
+                continue
+
+            # embedded email (.msg) -> open and recurse
+            if ext == ".msg" or getattr(att, "Type", None) == OL_ATTACH_EMBEDDED_ITEM:
+                try:
+                    inner = self.ns.OpenSharedItem(path)
+                    self.process_item(inner, f"{folder_path} > {name}", parent_key=key)
+                    rec["status"] = "parsed (embedded email)"
+                except Exception as e:
+                    rec["status"], rec["detail"] = "embedded open failed", str(e)
+                self.attachments.append(rec)
+                continue
+
+            try:
+                tables, text = parse_attachment(path)
+                for t_i, (tname, rows) in enumerate(tables, start=1):
+                    self.tables.extend(table_rows_to_cells(
+                        rows, key, f"{name} [{tname}]", t_i, header_row=not self.args.no_header))
+                n_kv = 0
+                for k, v in extract_kv(text):
+                    self.attach_fields.append({"email_key": key, "filename": name,
+                                               "field": clean(k), "value": clean(v)})
+                    n_kv += 1
+                rec["status"] = "parsed"
+                rec["detail"] = f"{len(tables)} table(s), {n_kv} field(s)"
+            except ValueError as e:
+                rec["status"], rec["detail"] = "skipped", str(e)
+            except Exception as e:
+                rec["status"], rec["detail"] = "parse failed", f"{type(e).__name__}: {e}"
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self.attachments.append(rec)
+
+    # ---- write workbook --------------------------------------------------- #
+    def write(self, out_path):
+        sheets = {
+            "Emails": self.emails,
+            "Body_Fields": self.body_fields,
+            "Body_Lines": self.body_lines,
+            "Tables": self.tables,
+            "Attach_Fields": self.attach_fields,
+            "Attachments": self.attachments,
+        }
+        # wide pivot: one row per email, one column per field label (first value wins)
+        all_fields = ([{**r, "src": "body"} for r in self.body_fields] +
+                      [{**r, "src": "attach"} for r in self.attach_fields])
+        wide = None
+        if all_fields:
+            f = pd.DataFrame(all_fields)
+            f["field"] = f["field"].str.strip().str.rstrip(":").str.title()
+            wide = f.drop_duplicates(["email_key", "field"]).pivot(
+                index="email_key", columns="field", values="value").reset_index()
+            meta = pd.DataFrame(self.emails)[["email_key", "received", "from_email", "subject"]]
+            wide = meta.merge(wide, on="email_key", how="right")
+
+        with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+            for name, rows in sheets.items():
+                if not rows:
+                    continue
+                df = pd.DataFrame(rows)
+                for start in range(0, len(df), EXCEL_ROW_MAX):
+                    part = df.iloc[start:start + EXCEL_ROW_MAX]
+                    sheet = name if start == 0 else f"{name}_{start // EXCEL_ROW_MAX + 1}"
+                    part.to_excel(xw, sheet_name=sheet[:31], index=False)
+            if wide is not None:
+                wide.iloc[:, :16000].to_excel(xw, sheet_name="Fields_Wide", index=False)
+
+            for ws in xw.book.worksheets:          # light formatting
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+                for col in ws.columns:
+                    width = max((len(str(c.value)) for c in list(col)[:200] if c.value), default=8)
+                    ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 8), 60)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def ask(prompt, default=""):
+    v = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+    return v or default
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Export Outlook email content to Excel.")
+    p.add_argument("--all", action="store_true", help="process every email in the folder(s)")
+    p.add_argument("--start", help="start date YYYY-MM-DD (inclusive)")
+    p.add_argument("--end", help="end date YYYY-MM-DD (inclusive)")
+    p.add_argument("--days", type=int, help="shortcut: last N days")
+    p.add_argument("--mode", choices=["inline", "attachments", "both"], help="what to extract")
+    p.add_argument("--folder", help='folder path, e.g. "Inbox" or "Inbox/Vendors" (default Inbox)')
+    p.add_argument("--mailbox", help="store/mailbox display name (for shared mailboxes)")
+    p.add_argument("--subfolders", action="store_true", help="include subfolders")
+    p.add_argument("--subject", help="only emails whose subject contains this text")
+    p.add_argument("--sender", help="only emails whose sender address contains this text")
+    p.add_argument("--lines", action="store_true", help="also write every body line as its own row")
+    p.add_argument("--keep-thread", action="store_true", help="parse quoted reply history too")
+    p.add_argument("--include-images", action="store_true", help="don't skip image attachments")
+    p.add_argument("--no-header", action="store_true", help="treat first row of attachment tables as data")
+    p.add_argument("--limit", type=int, help="stop after N emails (testing)")
+    p.add_argument("-o", "--out", help="output .xlsx path")
+    a = p.parse_args()
+
+    interactive = not (a.all or a.start or a.end or a.days) or not a.mode
+    if interactive:
+        print("\n=== Outlook -> Excel export ===")
+        if not (a.all or a.start or a.end or a.days):
+            scope = ask("Scope: (1) whole folder  (2) date range  (3) last N days", "2")
+            if scope == "1":
+                a.all = True
+            elif scope == "3":
+                a.days = int(ask("How many days", "7"))
+            else:
+                a.start = ask("Start date YYYY-MM-DD", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+                a.end = ask("End date YYYY-MM-DD", datetime.now().strftime("%Y-%m-%d"))
+        if not a.mode:
+            m = ask("Extract: (1) inline body  (2) attachments  (3) both", "3")
+            a.mode = {"1": "inline", "2": "attachments"}.get(m, "both")
+        if a.folder is None:
+            a.folder = ask("Folder path", "Inbox")
+            a.subfolders = ask("Include subfolders? y/n", "n").lower().startswith("y")
+    return a
+
+
+def main():
+    a = parse_args()
+    start = end = None
+    if a.days:
+        start = datetime.now() - timedelta(days=a.days)
+    if a.start:
+        start = datetime.strptime(a.start, "%Y-%m-%d")
+    if a.end:
+        end = datetime.strptime(a.end, "%Y-%m-%d") + timedelta(days=1)   # inclusive end date
+    if a.all:
+        start = end = None
+
+    out = a.out or f"outlook_export_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+
+    ns = get_namespace()
+    col = Collector(a)
+    col.ns = ns
+    root = resolve_folder(ns, a.folder, a.mailbox)
+
+    processed = 0
+    for folder in walk_folders(root, a.subfolders):
+        fpath = folder.FolderPath
+        try:
+            items = restrict_items(folder, start, end)
+        except Exception as e:
+            print(f"  ! skipping {fpath}: {e}")
+            continue
+        print(f"Scanning {fpath} ({items.Count} item(s))")
+        item = items.GetFirst()
+        while item is not None:
+            try:
+                if getattr(item, "Class", None) == OL_MAIL_ITEM_CLASS:
+                    if col.process_item(item, fpath):
+                        processed += 1
+                        if processed % 50 == 0:
+                            print(f"  …{processed} emails")
+            except pywintypes.com_error as e:
+                print(f"  ! COM error on an item: {e}")
+            except Exception:
+                print("  ! error on an item:\n" + traceback.format_exc(limit=2))
+            if a.limit and processed >= a.limit:
+                break
+            item = items.GetNext()
+        if a.limit and processed >= a.limit:
+            break
+
+    if processed == 0:
+        print("No matching emails found.")
+        return
+    col.write(out)
+    print(f"\nDone. {processed} email(s) -> {os.path.abspath(out)}")
+    print(f"  body fields: {len(col.body_fields)} | table cells: {len(col.tables)} | "
+          f"attachment fields: {len(col.attach_fields)} | attachments: {len(col.attachments)}")
+
+
+if __name__ == "__main__":
+    main()
