@@ -1,0 +1,331 @@
+"""
+log_search.py -- search one or many log directories (local or UNC) for words,
+phrases or regex patterns. Streams files line-by-line (no size limit), scans
+in parallel (helps a lot over SMB), reads .gz/.zip, handles UTF-8/UTF-16 logs.
+
+Install (optional, for Excel output):  pip install pandas openpyxl
+
+Examples
+  python log_search.py "\\\\server\\d$\\logs" -q "timeout"
+  python log_search.py "\\\\srv1\\d$\\logs" "\\\\srv2\\d$\\logs" "D:\\AppLogs" -q "error 500" -q "access denied"
+  python log_search.py "\\\\server\\d$\\logs" -r -q "Exception|FATAL" --regex --since 2026-09-25 -C 2
+  python log_search.py "\\\\server\\d$\\logs" --include "*.log,*.txt,*.gz" --terms terms.txt -o hits.xlsx
+  python log_search.py "\\\\server\\d$\\logs"            # prompts you for search terms
+
+Notes
+  * d$ admin shares need an account with admin rights on that server.
+  * Default: search the given folder only; add -r to include all subfolders.
+  * Output: console + optional .xlsx (auto-switches to .csv if > 1M hits) or .csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import fnmatch
+import gzip
+import io
+import os
+import re
+import sys
+import threading
+import time
+import zipfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+DEFAULT_INCLUDE = "*.log,*.txt,*.out,*.err,*.trc,*.log.*,*.gz,*.zip,*.csv,*.json,*.xml"
+EXCEL_MAX = 1_000_000
+print_lock = threading.Lock()
+
+
+# --------------------------------------------------------------------------- #
+# File discovery
+# --------------------------------------------------------------------------- #
+def iter_files(roots, recursive, include, exclude, since, until, min_size):
+    inc = [p.strip().lower() for p in include.split(",") if p.strip()]
+    exc = [p.strip().lower() for p in exclude.split(",") if p.strip()]
+    for root in roots:
+        if os.path.isfile(root):
+            yield root
+            continue
+        if not os.path.isdir(root):
+            print(f"! not reachable: {root}", file=sys.stderr)
+            continue
+        stack = [root]
+        while stack:
+            d = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                if recursive:
+                                    stack.append(e.path)
+                                continue
+                            name = e.name.lower()
+                            if inc and not any(fnmatch.fnmatch(name, p) for p in inc):
+                                continue
+                            if exc and any(fnmatch.fnmatch(name, p) for p in exc):
+                                continue
+                            st = e.stat()
+                            if since and st.st_mtime < since:
+                                continue
+                            if until and st.st_mtime >= until:
+                                continue
+                            if st.st_size < min_size:
+                                continue
+                            yield e.path
+                        except OSError as ex:
+                            print(f"! {e.path}: {ex}", file=sys.stderr)
+            except OSError as ex:
+                print(f"! cannot list {d}: {ex}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Reading (handles gz, zip, UTF-16 BOMs)
+# --------------------------------------------------------------------------- #
+def detect_encoding(head: bytes):
+    if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
+        return "utf-16"
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    # UTF-16 without BOM: lots of NUL bytes in alternating positions
+    if len(head) > 20 and head[1::2].count(0) > len(head) * 0.4:
+        return "utf-16-le"
+    return "utf-8"
+
+
+def text_stream(raw):
+    head = raw.peek(4096)[:4096] if hasattr(raw, "peek") else b""
+    enc = detect_encoding(head)
+    return io.TextIOWrapper(raw, encoding=enc, errors="replace", newline=None)
+
+
+def open_streams(path):
+    """Yield (display_name, text_stream) -- a zip yields one stream per member."""
+    low = path.lower()
+    if low.endswith(".gz"):
+        yield path, text_stream(io.BufferedReader(gzip.open(path, "rb")))
+    elif low.endswith(".zip"):
+        with zipfile.ZipFile(path) as z:
+            for info in z.infolist():
+                if not info.is_dir():
+                    with z.open(info) as member:
+                        yield f"{path}::{info.filename}", text_stream(io.BufferedReader(member))
+    else:
+        yield path, text_stream(open(path, "rb", buffering=1024 * 1024))
+
+
+def looks_binary(path):
+    if path.lower().endswith((".gz", ".zip")):
+        return False
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(2048)
+    except OSError:
+        return True
+    if detect_encoding(chunk).startswith("utf-16"):
+        return False
+    return b"\x00" in chunk
+
+
+# --------------------------------------------------------------------------- #
+# Searching one file
+# --------------------------------------------------------------------------- #
+def search_file(path, patterns, ctx_before, ctx_after, max_hits, invert=False):
+    hits = []
+    if looks_binary(path):
+        return hits, "binary-skipped"
+    try:
+        for name, stream in open_streams(path):
+            before = deque(maxlen=ctx_before)
+            pending = []  # hits still collecting "after" context: [hit, remaining]
+            with stream:
+                for n, line in enumerate(stream, start=1):
+                    line = line.rstrip("\r\n")
+                    for p in pending:
+                        p[0]["after"].append(line)
+                        p[1] -= 1
+                    pending = [p for p in pending if p[1] > 0]
+
+                    for label, rx in patterns:
+                        found = rx.search(line)
+                        if bool(found) != invert:
+                            hit = {"term": label, "file": name, "line_no": n,
+                                   "match": found.group(0) if found else "",
+                                   "line": line[:2000], "before": list(before), "after": []}
+                            hits.append(hit)
+                            if ctx_after:
+                                pending.append([hit, ctx_after])
+                            if max_hits and len(hits) >= max_hits:
+                                return hits, "max-hits"
+                    before.append(line)
+    except Exception as e:
+        return hits, f"error: {type(e).__name__}: {e}"
+    return hits, "ok"
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+def show(hit, color):
+    line = hit["line"]
+    if color and hit["match"]:
+        line = line.replace(hit["match"], f"\033[1;31m{hit['match']}\033[0m", 1)
+    with print_lock:
+        for b in hit["before"]:
+            print(f"    {b}")
+        print(f"{hit['file']}:{hit['line_no']}: [{hit['term']}] {line}")
+        for a in hit["after"]:
+            print(f"    {a}")
+        if hit["before"] or hit["after"]:
+            print("    --")
+
+
+def save(rows, out):
+    cols = ["term", "file", "line_no", "match", "line", "context_before", "context_after"]
+    recs = [{**{k: r[k] for k in ("term", "file", "line_no", "match", "line")},
+             "context_before": "\n".join(r["before"]), "context_after": "\n".join(r["after"])}
+            for r in rows]
+    if out.lower().endswith(".xlsx") and len(recs) > EXCEL_MAX:
+        out = out[:-5] + ".csv"
+        print(f"Too many rows for Excel; writing CSV instead.")
+    if out.lower().endswith(".xlsx"):
+        import pandas as pd
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+        df = pd.DataFrame(recs, columns=cols).map(
+            lambda v: ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v)
+        with pd.ExcelWriter(out, engine="openpyxl") as xw:
+            df.to_excel(xw, sheet_name="Hits", index=False)
+            summ = df.groupby(["term", "file"]).size().reset_index(name="hits")
+            summ.to_excel(xw, sheet_name="Summary", index=False)
+            for ws in xw.book.worksheets:
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+            ws = xw.book["Hits"]
+            for col, w in zip("ABCDEFG", (18, 60, 9, 25, 100, 50, 50)):
+                ws.column_dimensions[col].width = w
+    else:
+        with open(out, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(recs)
+    print(f"Saved {len(recs)} hit(s) -> {os.path.abspath(out)}")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def parse_date(s, end=False):
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if end and fmt == "%Y-%m-%d":
+                dt = dt.replace(hour=23, minute=59, second=59)
+            return dt.timestamp()
+        except ValueError:
+            pass
+    sys.exit(f"Bad date: {s} (use YYYY-MM-DD or 'YYYY-MM-DD HH:MM')")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Search log directories (local or UNC).")
+    p.add_argument("roots", nargs="+", help=r"folders or files, e.g. \\server\d$\logs")
+    p.add_argument("-q", "--query", action="append", default=[], help="search term (repeatable)")
+    p.add_argument("--terms", help="file with one search term per line")
+    p.add_argument("--regex", action="store_true", help="treat terms as regular expressions")
+    p.add_argument("--case", action="store_true", help="case-sensitive")
+    p.add_argument("-w", "--word", action="store_true", help="whole words only")
+    p.add_argument("--all", dest="all_terms", action="store_true",
+                   help="line must contain ALL terms (default: any term)")
+    p.add_argument("-v", "--invert", action="store_true", help="show lines NOT matching")
+    p.add_argument("-r", "--recursive", action="store_true", help="include subfolders")
+    p.add_argument("--include", default=DEFAULT_INCLUDE, help="comma-separated filename patterns")
+    p.add_argument("--exclude", default="", help="comma-separated filename patterns to skip")
+    p.add_argument("--since", help="only files modified on/after YYYY-MM-DD[ HH:MM]")
+    p.add_argument("--until", help="only files modified on/before YYYY-MM-DD[ HH:MM]")
+    p.add_argument("--min-size", type=int, default=1, help="skip files smaller than N bytes")
+    p.add_argument("-C", "--context", type=int, default=0, help="lines of context before+after")
+    p.add_argument("-B", type=int, help="lines of context before")
+    p.add_argument("-A", type=int, help="lines of context after")
+    p.add_argument("--max-per-file", type=int, default=0, help="stop a file after N hits")
+    p.add_argument("--threads", type=int, default=8, help="parallel files (8-16 good for SMB)")
+    p.add_argument("--quiet", action="store_true", help="don't print each hit")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("-o", "--out", help="save hits to .xlsx or .csv")
+    a = p.parse_args()
+
+    terms = list(a.query)
+    if a.terms:
+        terms += [l.strip() for l in open(a.terms, encoding="utf-8") if l.strip() and not l.startswith("#")]
+    if not terms:
+        raw = input("Search terms (separate several with ' | '): ").strip()
+        terms = [t.strip() for t in raw.split(" | ") if t.strip()]
+        if not terms:
+            sys.exit("No search terms.")
+
+    flags = 0 if a.case else re.IGNORECASE
+
+    def compile_term(t):
+        pat = t if a.regex else r"\s+".join(re.escape(w) for w in t.split())
+        if a.word:
+            pat = rf"\b(?:{pat})\b"
+        return re.compile(pat, flags)
+
+    try:
+        if a.all_terms and len(terms) > 1:
+            look = "".join(f"(?=.*?{compile_term(t).pattern})" for t in terms)
+            patterns = [(" AND ".join(terms), re.compile(look + r".*", flags))]
+        else:
+            patterns = [(t, compile_term(t)) for t in terms]
+    except re.error as e:
+        sys.exit(f"Bad regex: {e}")
+
+    before = a.B if a.B is not None else a.context
+    after = a.A if a.A is not None else a.context
+    color = not a.no_color and sys.stdout.isatty()
+    if color and os.name == "nt":
+        os.system("")  # enable ANSI colors in Windows console
+
+    since, until = parse_date(a.since), parse_date(a.until, end=True)
+    print("Listing files…", file=sys.stderr)
+    files = list(iter_files(a.roots, a.recursive, a.include, a.exclude, since, until, a.min_size))
+    print(f"{len(files)} file(s) to search with {a.threads} thread(s)\n", file=sys.stderr)
+
+    t0, rows, problems, done = time.time(), [], [], 0
+    with ThreadPoolExecutor(max_workers=a.threads) as pool:
+        futs = {pool.submit(search_file, f, patterns, before, after, a.max_per_file, a.invert): f
+                for f in files}
+        for fut in as_completed(futs):
+            hits, status = fut.result()
+            done += 1
+            if status.startswith("error"):
+                problems.append((futs[fut], status))
+            rows.extend(hits)
+            if not a.quiet:
+                for h in hits:
+                    show(h, color)
+            if done % 100 == 0:
+                print(f"  …{done}/{len(files)} files, {len(rows)} hits", file=sys.stderr)
+
+    print(f"\n{len(rows)} hit(s) in {len({r['file'] for r in rows})} file(s); "
+          f"searched {len(files)} file(s) in {time.time() - t0:.1f}s", file=sys.stderr)
+    by_term = {}
+    for r in rows:
+        by_term[r["term"]] = by_term.get(r["term"], 0) + 1
+    for t, c in by_term.items():
+        print(f"  {c:>8}  {t}", file=sys.stderr)
+    for f, s in problems[:20]:
+        print(f"! {f}: {s}", file=sys.stderr)
+
+    if a.out and rows:
+        rows.sort(key=lambda r: (r["file"], r["line_no"]))
+        save(rows, a.out)
+
+
+if __name__ == "__main__":
+    main()
