@@ -1,0 +1,283 @@
+"""
+pdf_search.py -- search large PDFs for words, phrases, patterns, or ideas.
+
+Search modes
+  exact     word/phrase match (case-insensitive, whole-word by default)
+  regex     regular expression, e.g.  "audit\\s+trail|access\\s+log"
+  fuzzy     tolerant of typos / OCR errors / slight rewording
+  semantic  "ideas" -- finds sentences that MEAN the same thing,
+            e.g. "the nurse changed the record after the patient died"
+            (runs fully offline after a one-time model download)
+
+Install
+  pip install pymupdf rapidfuzz pandas openpyxl
+  pip install sentence-transformers      # only needed for semantic mode
+  (scanned PDFs with no text layer: run `ocrmypdf in.pdf out.pdf` first)
+
+Use
+  python pdf_search.py big.pdf                        # interactive: type queries repeatedly
+  python pdf_search.py C:\\Cases\\Smith --recursive   # every PDF in a folder
+  python pdf_search.py big.pdf -q "audit trail" -q "late entry" --mode exact
+  python pdf_search.py big.pdf -q "record altered after death" --mode semantic --top 25
+  python pdf_search.py big.pdf --terms terms.txt --mode fuzzy -o hits.xlsx
+
+Interactive prefixes (override the mode for one query):
+  re: <pattern>    ~ <fuzzy text>    ? <idea / sentence>    plain text = exact
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24
+except ImportError:
+    import fitz
+
+CONTEXT_CHARS = 160
+
+
+# --------------------------------------------------------------------------- #
+# Loading: one record per sentence, with page number
+# --------------------------------------------------------------------------- #
+SENT_SPLIT = re.compile(r"(?<=[.!?;])\s+(?=[A-Z0-9\"'(])|\n{2,}")
+
+
+def load_pdf(path: Path):
+    """Return (pages, sentences). pages: list[str]; sentences: list[dict]."""
+    pages, sents = [], []
+    with fitz.open(path) as doc:
+        for p_no, page in enumerate(doc, start=1):
+            text = page.get_text("text") or ""
+            pages.append(text)
+            flat = re.sub(r"[ \t]+", " ", text)
+            for s in SENT_SPLIT.split(flat):
+                s = " ".join(s.split())
+                if len(s) >= 15:
+                    sents.append({"file": path.name, "page": p_no, "text": s})
+    return pages, sents
+
+
+def snippet(text: str, start: int, end: int) -> str:
+    a, b = max(0, start - CONTEXT_CHARS), min(len(text), end + CONTEXT_CHARS)
+    s = " ".join(text[a:b].split())
+    return ("…" if a > 0 else "") + s + ("…" if b < len(text) else "")
+
+
+# --------------------------------------------------------------------------- #
+# Search modes
+# --------------------------------------------------------------------------- #
+def search_pattern(docs, query, regex=False, whole_word=True, case=False):
+    if regex:
+        pat = query
+    else:
+        # let spaces match line breaks / multiple spaces inside the PDF text
+        pat = r"\s+".join(re.escape(w) for w in query.split())
+        if whole_word:
+            pat = rf"\b{pat}\b"
+    rx = re.compile(pat, 0 if case else re.IGNORECASE)
+    hits = []
+    for path, (pages, _) in docs.items():
+        for p_no, text in enumerate(pages, start=1):
+            for m in rx.finditer(text):
+                hits.append({"file": path.name, "page": p_no, "match": " ".join(m.group(0).split()),
+                             "score": 100, "context": snippet(text, m.start(), m.end())})
+    return hits
+
+
+def search_fuzzy(docs, query, threshold=80):
+    from rapidfuzz import fuzz
+    hits = []
+    q = query.lower()
+    for path, (_, sents) in docs.items():
+        for s in sents:
+            score = fuzz.partial_ratio(q, s["text"].lower())
+            if score >= threshold:
+                hits.append({"file": s["file"], "page": s["page"], "match": query,
+                             "score": round(score, 1), "context": s["text"]})
+    return sorted(hits, key=lambda h: -h["score"])
+
+
+class Semantic:
+    """Sentence-embedding search with an on-disk cache per PDF (big files embed once)."""
+
+    def __init__(self, model_name="all-MiniLM-L6-v2", cache_dir=".pdf_search_cache"):
+        from sentence_transformers import SentenceTransformer
+        import numpy as np
+        self.np = np
+        self.model = SentenceTransformer(model_name)
+        self.cache = Path(cache_dir)
+        self.cache.mkdir(exist_ok=True)
+        self.index = {}  # path -> (embeddings, sentences)
+
+    def _key(self, path: Path):
+        st = path.stat()
+        return hashlib.md5(f"{path.resolve()}|{st.st_size}|{st.st_mtime}".encode()).hexdigest()
+
+    def prepare(self, docs):
+        for path, (_, sents) in docs.items():
+            if path in self.index:
+                continue
+            f = self.cache / f"{self._key(path)}.npy"
+            if f.exists():
+                emb = self.np.load(f)
+            else:
+                print(f"  embedding {path.name} ({len(sents)} sentences, one-time)…")
+                emb = self.model.encode([s["text"] for s in sents], batch_size=64,
+                                        normalize_embeddings=True, show_progress_bar=True)
+                self.np.save(f, emb)
+            self.index[path] = (emb, sents)
+
+    def search(self, docs, query, top=15, min_score=0.35):
+        self.prepare(docs)
+        qv = self.model.encode([query], normalize_embeddings=True)[0]
+        hits = []
+        for emb, sents in self.index.values():
+            if len(sents) == 0:
+                continue
+            scores = emb @ qv
+            for i in self.np.argsort(-scores)[:top]:
+                if scores[i] >= min_score:
+                    s = sents[i]
+                    hits.append({"file": s["file"], "page": s["page"], "match": query,
+                                 "score": round(float(scores[i]) * 100, 1), "context": s["text"]})
+        return sorted(hits, key=lambda h: -h["score"])[:top]
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+def print_hits(query, mode, hits, limit=50):
+    print(f"\n=== [{mode}] \"{query}\" -> {len(hits)} hit(s)")
+    for h in hits[:limit]:
+        tag = f"{h['score']:>5}" if mode in ("fuzzy", "semantic") else ""
+        print(f"  {h['file']}  p.{h['page']:<5}{tag}  {h['context']}")
+    if len(hits) > limit:
+        print(f"  … {len(hits) - limit} more (use -o to save all)")
+    if hits:
+        pages = sorted({(h['file'], h['page']) for h in hits})
+        print("  pages:", ", ".join(f"{f}:{p}" if len(docs_names) > 1 else str(p) for f, p in pages)[:500])
+
+
+def save_excel(all_rows, out):
+    import pandas as pd
+    df = pd.DataFrame(all_rows, columns=["query", "mode", "file", "page", "score", "match", "context"])
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="Hits", index=False)
+        summary = (df.groupby(["query", "mode", "file"])
+                     .agg(hits=("page", "size"), pages=("page", lambda p: ", ".join(map(str, sorted(set(p))))))
+                     .reset_index())
+        summary.to_excel(xw, sheet_name="Summary", index=False)
+        for ws in xw.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+        xw.book["Hits"].column_dimensions["G"].width = 120
+    print(f"\nSaved {len(df)} hit(s) -> {os.path.abspath(out)}")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+docs_names: list[str] = []
+
+
+def run_query(docs, query, mode, args, sem_holder, rows):
+    if mode == "exact":
+        hits = search_pattern(docs, query, whole_word=not args.partial, case=args.case)
+    elif mode == "regex":
+        hits = search_pattern(docs, query, regex=True, case=args.case)
+    elif mode == "fuzzy":
+        hits = search_fuzzy(docs, query, threshold=args.threshold)
+    else:
+        if sem_holder[0] is None:
+            print("Loading semantic model (first time downloads ~90 MB)…")
+            sem_holder[0] = Semantic()
+        hits = sem_holder[0].search(docs, query, top=args.top)
+    print_hits(query, mode, hits)
+    rows.extend({"query": query, "mode": mode, **h} for h in hits)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Search large PDFs for words, phrases, patterns or ideas.")
+    p.add_argument("paths", nargs="+", help="PDF file(s) and/or folder(s)")
+    p.add_argument("-q", "--query", action="append", default=[], help="search string (repeatable)")
+    p.add_argument("--terms", help="text file with one search string per line")
+    p.add_argument("--mode", choices=["exact", "regex", "fuzzy", "semantic"], default="exact")
+    p.add_argument("--recursive", action="store_true", help="include PDFs in subfolders")
+    p.add_argument("--partial", action="store_true", help="exact mode: match inside words too")
+    p.add_argument("--case", action="store_true", help="case-sensitive")
+    p.add_argument("--threshold", type=int, default=80, help="fuzzy minimum score 0-100")
+    p.add_argument("--top", type=int, default=15, help="semantic: max results per query")
+    p.add_argument("-o", "--out", help="save all hits to this .xlsx")
+    a = p.parse_args()
+
+    files = []
+    for raw in a.paths:
+        pth = Path(raw)
+        if pth.is_dir():
+            files += sorted(pth.rglob("*.pdf") if a.recursive else pth.glob("*.pdf"))
+        elif pth.suffix.lower() == ".pdf":
+            files.append(pth)
+    if not files:
+        sys.exit("No PDFs found.")
+
+    docs = {}
+    for f in files:
+        try:
+            pages, sents = load_pdf(f)
+        except Exception as e:
+            print(f"  ! could not open {f.name}: {e}")
+            continue
+        chars = sum(len(t) for t in pages)
+        warn = "  <-- little/no text; may need OCR" if chars < 50 * len(pages) else ""
+        print(f"Loaded {f.name}: {len(pages)} pages{warn}")
+        docs[f] = (pages, sents)
+    docs_names.extend(f.name for f in docs)
+
+    queries = list(a.query)
+    if a.terms:
+        queries += [l.strip() for l in open(a.terms, encoding="utf-8") if l.strip() and not l.startswith("#")]
+
+    rows, sem = [], [None]
+    if queries:
+        for q in queries:
+            run_query(docs, q, a.mode, a, sem, rows)
+    else:
+        print("\nType a search and press Enter.  Prefixes:  re: regex   ~ fuzzy   ? idea   "
+              "(plain = exact)\nCommands: :save file.xlsx   :quit")
+        while True:
+            try:
+                q = input("\nsearch> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not q:
+                continue
+            if q in (":q", ":quit", "exit"):
+                break
+            if q.startswith(":save"):
+                save_excel(rows, q.split(maxsplit=1)[1] if " " in q else "pdf_hits.xlsx")
+                continue
+            if q.startswith("re:"):
+                mode, q = "regex", q[3:].strip()
+            elif q.startswith("~"):
+                mode, q = "fuzzy", q[1:].strip()
+            elif q.startswith("?"):
+                mode, q = "semantic", q[1:].strip()
+            else:
+                mode = a.mode
+            try:
+                run_query(docs, q, mode, a, sem, rows)
+            except re.error as e:
+                print(f"  bad regex: {e}")
+
+    if a.out and rows:
+        save_excel(rows, a.out)
+
+
+if __name__ == "__main__":
+    main()
