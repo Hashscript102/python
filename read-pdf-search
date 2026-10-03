@@ -1,0 +1,27 @@
+Here's pdf_search.py. It uses PyMuPDF, which is fast enough for PDFs with thousands of pages.
+
+Setup
+
+pip install pymupdf rapidfuzz pandas openpyxl
+pip install sentence-transformers   # only for "ideas" search
+
+Interactive use: run python pdf_search.py bigfile.pdf and type searches one after another. The PDF loads once, so later searches come back almost instantly.
+
+Plain text finds an exact word or phrase, even when the phrase is split across a line break in the PDF.
+~ medicaton recrd is fuzzy search, which tolerates typos and OCR errors.
+re: \d{2}:\d{2} is a regex search, for things like timestamps, case numbers or dates.
+? the record was changed after the patient died is an "ideas" search. It finds sentences with the same meaning even if none of those words appear in them.
+:save hits.xlsx exports every hit with its file, page and surrounding context, plus a summary sheet.
+
+Batch use: search a whole folder against a term list and save the results:
+
+python pdf_search.py C:\Cases\Smith --recursive --terms terms.txt -o hits.xlsx
+
+terms.txt has one term per line, which makes it easy to keep a standard term list for each case.
+
+What I tested and what to know:
+
+I tested exact, fuzzy and regex search here. I couldn't test the "ideas" mode, because downloading its model is blocked in my sandbox.
+The first "ideas" search downloads a roughly 90 MB model one time. After that it runs fully offline, so documents never leave your machine.
+That mode caches each PDF's index on disk, so a large file is processed only once.
+Scanned PDFs have no text to search. The script flags them, and running ocrmypdf in.pdf out.pdf first fixes that.
